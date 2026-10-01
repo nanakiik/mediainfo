@@ -6,13 +6,33 @@ use std::sync::OnceLock;
 static SAMPLE_RATE: OnceLock<u32> = OnceLock::new();
 static BIT_DEPTH: OnceLock<u8> = OnceLock::new();
 
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-4.2
+// name-interchannel-decorrelation
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Independent,
+    Leftside,
+    Midside,
+    Sideright,
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-4.3
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prediction {
+    Verbatim,
+    Constant,
+    Fixedpredictor,
+    Linearpredictor,
+}
+
 // https://datatracker.ietf.org/doc/html/rfc9639/#section-5
 // #name-format-principles
 // All numbers used in a FLAC bitstream are integers
 // All numbers are big-endian coded
 // All samples encoded to and decoded from the FLAC format MUST be in a signed representation.
 // Unary coding in a FLAC bitstream is done with zero bits terminated with a one bit
-//
 
 // https://datatracker.ietf.org/doc/html/rfc9639/#section-6
 // name-format-layout-overview
@@ -93,7 +113,7 @@ pub struct StreamInfo {
     pub checksum: [u8; 16],
 }
 
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-8.4
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-8.3
 // name-padding
 pub struct Padding<'a> {
     // u(n) n is 8 times the size described in the metadata block header.
@@ -402,17 +422,6 @@ pub struct FrameHeader {
     pub pos: usize,
 }
 
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-4.2
-// name-interchannel-decorrelation
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Channel {
-    Independent,
-    Leftside,
-    Midside,
-    Sideright,
-}
-
 impl FrameHeader {
     pub fn new(buf: &[u8]) -> FrameHeader {
         let temp = u16::from_be_bytes([buf[0], buf[1]]);
@@ -609,8 +618,240 @@ pub enum SubframeType {
     // Subframe with a linear predictor of order v-31; i.e., 1 through 32 (inclusive)
     LinearPredictor,
 }
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2
+// name-subframes
+pub fn read_subframe(stream: &mut BitReader, mut precision: usize, block_size: u32) -> Vec<i32> {
+    assert_eq!(stream.read_bits(1), 0);
+    let subframe_type = stream.read_bits(6) as u8;
+    if stream.read_bits(1) != 0 {
+        while stream.read_bits(1) == 1 {}
+        let w = stream.position() + 1;
+        precision -= w;
+    }
+    let subframe;
+    let samples = match subframe_type {
+        0 => {
+            subframe = Subframe {
+                subframe_type: SubframeType::Constant,
+                order: None,
+            };
+            read_subframe_constant(stream, block_size, precision as u32)
+        }
+        1 => {
+            subframe = Subframe {
+                subframe_type: SubframeType::Verbatim,
+                order: None,
+            };
+            read_subframe_verbatim(stream, block_size, precision as u32)
+        }
+        2..8 => unreachable!("Reserved"),
+        8..=12 => {
+            let order = subframe_type & 7;
+            subframe = Subframe {
+                subframe_type: SubframeType::FixedPredictor,
+                order: Some(order),
+            };
+            read_subframe_fixed(stream, block_size, precision, order as usize)
+        }
+        13..=31 => unreachable!("Reserved"),
+        32..64 => {
+            let order = (subframe_type & 0b11111) + 1;
+            subframe = Subframe {
+                subframe_type: SubframeType::LinearPredictor,
+                order: Some(order),
+            };
+            read_subframe_lpc(stream, block_size, precision, order as usize)
+        }
+        _ => unreachable!("overflow"),
+    };
+    let str = if let Some(order) = subframe.order {
+        std::format!("order={order}")
+    } else {
+        std::format!("")
+    };
+    println!("  subframe type={:?} {str}", subframe.subframe_type);
+    samples
+}
 
-// https://datatracker.ietf.org/doc/html/rfc9639/#name-frame-footer
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.3
+// name-constant-subframe
+pub fn read_subframe_constant(stream: &mut BitReader, block_size: u32, bps: u32) -> Vec<i32> {
+    let sample = stream.read_signed(bps as usize).unwrap() as i32;
+    vec![sample; block_size as usize]
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.4
+// Verbatim Subframe
+pub fn read_subframe_verbatim(stream: &mut BitReader, block_size: u32, bps: u32) -> Vec<i32> {
+    let mut samples = Vec::with_capacity(block_size as usize);
+    for _ in 0..block_size {
+        samples.push(stream.read_signed(bps as usize).unwrap() as i32);
+    }
+    samples
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.5
+// name-fixed-predictor-subframe
+pub fn read_subframe_fixed(
+    stream: &mut BitReader,
+    block_size: u32,
+    bps: usize,
+    order: usize,
+) -> Vec<i32> {
+    let mut samples = Vec::with_capacity(block_size as usize);
+    for _ in 0..order {
+        samples.push(stream.read_signed(bps).unwrap() as i32);
+    }
+    read_residual(stream, &mut samples, block_size, order);
+    fixed_restore(&mut samples, order);
+    samples
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.6
+// name-linear-predictor-subframe
+pub fn read_subframe_lpc(
+    stream: &mut BitReader,
+    block_size: u32,
+    bps: usize,
+    order: usize,
+) -> Vec<i32> {
+    let mut samples = Vec::with_capacity(block_size as usize);
+    for _ in 0..order {
+        let warm_up = stream.read_signed(bps).unwrap();
+        samples.push(warm_up as i32);
+    }
+    let predictor_coefficient_precision = stream.read_bits(4) as usize + 1;
+    let prediction_right_shift_bits = stream.read_signed(5).unwrap();
+
+    let mut qlp_coefficients = Vec::with_capacity(order as usize);
+    for _ in 0..order {
+        let predictor_coefficient = stream.read_signed(predictor_coefficient_precision).unwrap();
+        qlp_coefficients.push(predictor_coefficient as i32);
+    }
+    read_residual(stream, &mut samples, block_size, order);
+    lpc_restore(
+        &mut samples,
+        &qlp_coefficients,
+        prediction_right_shift_bits as u32,
+    );
+    samples
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.7
+// name-coded-residual
+pub fn read_residual(
+    stream: &mut BitReader,
+    samples: &mut Vec<i32>,
+    block_size: u32,
+    order: usize,
+) {
+    let residual_indicate = stream.read_bits(2);
+    let (parameter_bit, val) = if residual_indicate == 0 {
+        (4, 0b1111)
+    } else if residual_indicate == 1 {
+        (5, 0b11111)
+    } else {
+        unreachable!()
+    };
+    let partition_order = stream.read_bits(4);
+    let partitions = 1u32 << partition_order;
+    let partition_size = (block_size / partitions) as usize;
+    for i in 0..partitions {
+        let number = if i == 0 {
+            partition_size - order
+        } else {
+            partition_size
+        };
+        // https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.7.2
+        // name-rice-code
+        let parameter = stream.read_bits(parameter_bit);
+        // https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.7.1
+        // name-escaped-partition
+        if parameter == val {
+            let bits = stream.read_bits(5);
+            for _ in 0..number {
+                let sample = stream.read_signed(bits as usize).unwrap();
+                samples.push(sample as i32);
+            }
+        } else {
+            for _ in 0..number {
+                let q = stream.unary();
+                let r = stream.read_bits(parameter as usize);
+                let u = ((q as u64) << parameter) | r;
+                let signed: i64 = if u & 1 == 0 {
+                    (u >> 1) as i64
+                } else {
+                    -(((u + 1) >> 1) as i64)
+                };
+                samples.push(signed as i32);
+            }
+        }
+    }
+}
+
+pub fn fixed_restore(samples: &mut [i32], order: usize) {
+    let len: usize = samples.len();
+    match order {
+        0 => {}
+        1 => {
+            for t in order..len {
+                let p = samples[t - 1] as i64;
+                samples[t] = (p + samples[t] as i64) as i32;
+            }
+        }
+        2 => {
+            for t in order..len {
+                let p = 2 * samples[t - 1] as i64 - samples[t - 2] as i64;
+                samples[t] = (p + samples[t] as i64) as i32;
+            }
+        }
+        3 => {
+            for t in order..len {
+                let p =
+                    3 * samples[t - 1] as i64 - 3 * samples[t - 2] as i64 + samples[t - 3] as i64;
+                samples[t] = (p + samples[t] as i64) as i32;
+            }
+        }
+        4 => {
+            for t in order..len {
+                let p = 4 * samples[t - 1] as i64 - 6 * samples[t - 2] as i64
+                    + 4 * samples[t - 3] as i64
+                    - samples[t - 4] as i64;
+                samples[t] = (p + samples[t] as i64) as i32;
+            }
+        }
+        _ => {
+            unreachable!();
+        }
+    }
+}
+
+pub fn lpc_restore(
+    samples: &mut [i32],
+    qlp_coefficients: &[i32],
+    prediction_right_shift_bits: u32,
+) {
+    let order = qlp_coefficients.len();
+    let len = samples.len();
+    let mut rc_stack = [0i32; 32];
+    let n = order.min(32);
+    for (j, &c) in qlp_coefficients.iter().rev().take(n).enumerate() {
+        rc_stack[j] = c;
+    }
+    let rc = &rc_stack[..n];
+    for t in order..len {
+        let window = &samples[t - order..t];
+        let mut pred: i64 = 0;
+        for (&s, &c) in window.iter().zip(rc) {
+            pred += (c as i64) * (s as i64);
+        }
+        let predicted = (pred >> prediction_right_shift_bits) as i32;
+        samples[t] = predicted.wrapping_add(samples[t]);
+    }
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.3
+// name-frame-footer
 pub fn crc16(data: &[u8]) -> u16 {
     let poly: u16 = 0x8005;
     let mut crc: u16 = 0x0000;
@@ -787,17 +1028,21 @@ pub fn read_frame(buf: &[u8]) {
     while pos < buf.len() {
         let start = pos;
         let frame_header = FrameHeader::new(&buf[pos..]);
-        let is_variable = frame_header.blocking_strategy_bit;
         let block_size = frame_header.block_size();
         let sample_rate = frame_header.sample_rate();
         let channel = frame_header.channel();
         let bit_depth = frame_header.bit_depth();
         let number = frame_header.code_number;
+        let str = if frame_header.blocking_strategy_bit {
+            std::format!("sample{number}")
+        } else {
+            std::format!("frame{number}")
+        };
         pos += frame_header.pos;
         assert_eq!(frame_header.crc, FrameHeader::crc8(&buf[start..pos - 1]));
         let assignment = frame_header.channel_assignment();
         println!(
-            "frame{number} variable({is_variable}) blocksize={block_size} sample_rate={sample_rate} channels={channel}({assignment:?}) bit_depth={bit_depth}"
+            "{str} blocksize={block_size} sample_rate={sample_rate} channels={channel}({assignment:?}) bit_depth={bit_depth}"
         );
         let mut stream = BitReader::new(&buf[pos..]);
         for i in 0..channel {
@@ -822,7 +1067,7 @@ pub fn read_frame(buf: &[u8]) {
                     }
                 }
             }
-            read_subframe(&mut stream, precision, block_size as u32);
+            let _subframe = read_subframe(&mut stream, precision, block_size as u32);
         }
         // https://datatracker.ietf.org/doc/html/rfc9639/#section-9.3
         // name-frame-footer
@@ -830,235 +1075,6 @@ pub fn read_frame(buf: &[u8]) {
         pos += stream.bit_pos / 8 + temp + 2;
         // This CRC covers the whole frame, excluding the 16-bit CRC but including the sync code.
         let _crc_16 = u16::from_le_bytes([buf[pos - 2], buf[pos - 1]]);
-    }
-}
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2
-// name-subframes
-pub fn read_subframe(stream: &mut BitReader, mut precision: usize, block_size: u32) {
-    assert_eq!(stream.read_bits(1), 0);
-    let subframe_type = stream.read_bits(6) as u8;
-    if stream.read_bits(1) != 0 {
-        while stream.read_bits(1) == 1 {}
-        let w = stream.position() + 1;
-        precision -= w;
-    }
-    let subframe;
-    let _samples = match subframe_type {
-        0 => {
-            subframe = Subframe {
-                subframe_type: SubframeType::Constant,
-                order: None,
-            };
-            read_subframe_constant(stream, block_size, precision as u32)
-        }
-        1 => {
-            subframe = Subframe {
-                subframe_type: SubframeType::Verbatim,
-                order: None,
-            };
-            read_subframe_verbatim(stream, block_size, precision as u32)
-        }
-        2..8 => unreachable!("Reserved"),
-        8..=12 => {
-            let order = subframe_type & 7;
-            subframe = Subframe {
-                subframe_type: SubframeType::FixedPredictor,
-                order: Some(order),
-            };
-            read_subframe_fixed(stream, block_size, precision, order as usize)
-        }
-        13..=31 => unreachable!("Reserved"),
-        32..64 => {
-            let order = (subframe_type & 0b11111) + 1;
-            subframe = Subframe {
-                subframe_type: SubframeType::LinearPredictor,
-                order: Some(order),
-            };
-            read_subframe_lpc(stream, block_size, precision, order as usize)
-        }
-        _ => unreachable!("overflow"),
-    };
-    let str = if let Some(order) = subframe.order {
-        std::format!("order={order}")
-    } else {
-        std::format!("")
-    };
-    println!("  subframe type={:?} {str}", subframe.subframe_type);
-}
-
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.3
-// name-constant-subframe
-pub fn read_subframe_constant(stream: &mut BitReader, block_size: u32, bps: u32) -> Vec<i32> {
-    let sample = stream.read_signed(bps as usize).unwrap() as i32;
-    vec![sample; block_size as usize]
-}
-
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.4
-// Verbatim Subframe
-pub fn read_subframe_verbatim(stream: &mut BitReader, block_size: u32, bps: u32) -> Vec<i32> {
-    let mut samples = Vec::with_capacity(block_size as usize);
-    for _ in 0..block_size {
-        samples.push(stream.read_signed(bps as usize).unwrap() as i32);
-    }
-    samples
-}
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.5
-// name-fixed-predictor-subframe
-pub fn read_subframe_fixed(
-    stream: &mut BitReader,
-    block_size: u32,
-    bps: usize,
-    order: usize,
-) -> Vec<i32> {
-    let mut samples = Vec::with_capacity(block_size as usize);
-    for _ in 0..order {
-        samples.push(stream.read_signed(bps).unwrap() as i32);
-    }
-    read_residual(stream, &mut samples, block_size, order);
-    fixed_restore(&mut samples, order);
-    samples
-}
-
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.6
-// name-linear-predictor-subframe
-pub fn read_subframe_lpc(
-    stream: &mut BitReader,
-    block_size: u32,
-    bps: usize,
-    order: usize,
-) -> Vec<i32> {
-    let mut samples = Vec::with_capacity(block_size as usize);
-    for _ in 0..order {
-        let warm_up = stream.read_signed(bps).unwrap();
-        samples.push(warm_up as i32);
-    }
-    let predictor_coefficient_precision = stream.read_bits(4) as usize + 1;
-    let prediction_right_shift_bits = stream.read_signed(5).unwrap();
-
-    let mut qlp_coefficients = Vec::with_capacity(order as usize);
-    for _ in 0..order {
-        let predictor_coefficient = stream.read_signed(predictor_coefficient_precision).unwrap();
-        qlp_coefficients.push(predictor_coefficient as i32);
-    }
-    read_residual(stream, &mut samples, block_size, order);
-    lpc_restore(
-        &mut samples,
-        &qlp_coefficients,
-        prediction_right_shift_bits as u32,
-    );
-    samples
-}
-// https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.7
-// name-coded-residual
-pub fn read_residual(
-    stream: &mut BitReader,
-    samples: &mut Vec<i32>,
-    block_size: u32,
-    order: usize,
-) {
-    let residual_indicate = stream.read_bits(2);
-    let (parameter_bit, val) = if residual_indicate == 0 {
-        (4, 0b1111)
-    } else if residual_indicate == 1 {
-        (5, 0b11111)
-    } else {
-        unreachable!()
-    };
-    let partition_order = stream.read_bits(4);
-    let partitions = 1u32 << partition_order;
-    let partition_size = (block_size / partitions) as usize;
-    for i in 0..partitions {
-        let number = if i == 0 {
-            partition_size - order
-        } else {
-            partition_size
-        };
-        // https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.7.2
-        // name-rice-code
-        let parameter = stream.read_bits(parameter_bit);
-        // https://datatracker.ietf.org/doc/html/rfc9639/#section-9.2.7.1
-        // name-escaped-partition
-        if parameter == val {
-            let bits = stream.read_bits(5);
-            for _ in 0..number {
-                let sample = stream.read_signed(bits as usize).unwrap();
-                samples.push(sample as i32);
-            }
-        } else {
-            for _ in 0..number {
-                let q = stream.unary();
-                let r = stream.read_bits(parameter as usize);
-                let u = ((q as u64) << parameter) | r;
-                let signed: i64 = if u & 1 == 0 {
-                    (u >> 1) as i64
-                } else {
-                    -((u >> 1) as i64) - 1
-                };
-                samples.push(signed as i32);
-            }
-        }
-    }
-}
-
-//
-pub fn fixed_restore(samples: &mut [i32], order: usize) {
-    let len: usize = samples.len();
-    match order {
-        0 => {}
-        1 => {
-            for t in order..len {
-                let p = samples[t - 1] as i64;
-                samples[t] = (p + samples[t] as i64) as i32;
-            }
-        }
-        2 => {
-            for t in order..len {
-                let p = 2 * samples[t - 1] as i64 - samples[t - 2] as i64;
-                samples[t] = (p + samples[t] as i64) as i32;
-            }
-        }
-        3 => {
-            for t in order..len {
-                let p =
-                    3 * samples[t - 1] as i64 - 3 * samples[t - 2] as i64 + samples[t - 3] as i64;
-                samples[t] = (p + samples[t] as i64) as i32;
-            }
-        }
-        4 => {
-            for t in order..len {
-                let p = 4 * samples[t - 1] as i64 - 6 * samples[t - 2] as i64
-                    + 4 * samples[t - 3] as i64
-                    - samples[t - 4] as i64;
-                samples[t] = (p + samples[t] as i64) as i32;
-            }
-        }
-        _ => {
-            unreachable!();
-        }
-    }
-}
-
-pub fn lpc_restore(
-    samples: &mut [i32],
-    qlp_coefficients: &[i32],
-    prediction_right_shift_bits: u32,
-) {
-    let order = qlp_coefficients.len();
-    let len = samples.len();
-    let mut rc_stack = [0i32; 32];
-    let n = order.min(32);
-    for (j, &c) in qlp_coefficients.iter().rev().take(n).enumerate() {
-        rc_stack[j] = c;
-    }
-    let rc = &rc_stack[..n];
-    for t in order..len {
-        let window = &samples[t - order..t];
-        let mut pred: i64 = 0;
-        for (&s, &c) in window.iter().zip(rc) {
-            pred += (c as i64) * (s as i64);
-        }
-        let predicted = (pred >> prediction_right_shift_bits) as i32;
-        samples[t] = predicted.wrapping_add(samples[t]);
     }
 }
 
@@ -1072,7 +1088,6 @@ fn main() -> io::Result<()> {
     let (blocks, pos) = read_block(&buf[4..]);
     parse_block(blocks);
     let frames_data = &buf[pos + 4..];
-
     read_frame(frames_data);
     Ok(())
 }
