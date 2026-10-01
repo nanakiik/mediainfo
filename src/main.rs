@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 // https://www.w3.org/TR/png-3/#3PNGsignature
 pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -1064,15 +1064,14 @@ pub fn parse_chunk(chunks: &Vec<Chunk<'_>>) {
     let len = out.len();
     let channel = image_type.channel();
     let height = height as usize;
-
     let scan = len / height;
     let mut prev_scanline = vec![0; scan - 1];
-    println!("filter:(0 none, 1 sub, 2 up, 3 avg, 4 paeth)");
+    let mut filters = Vec::with_capacity(height);
     for i in 0..height {
         let start = scan * i;
         let end = scan * (i + 1);
         let filter = FilterType::filter_type(out[start]);
-        print!("{}", out[start]);
+        filters.push(out[start]);
         filter.unfilter(
             &mut out[start + 1..end],
             &prev_scanline,
@@ -1080,13 +1079,20 @@ pub fn parse_chunk(chunks: &Vec<Chunk<'_>>) {
         );
         prev_scanline.copy_from_slice(&out[start + 1..end]);
     }
-    println!();
-    // let mut rgb = Vec::with_capacity(height * (scan - 1));
-    // for i in 0..height {
-    //     let start = scan * i;
-    //     let end = scan * (i + 1);
-    //     rgb.extend_from_slice(&out[start + 1..end]);
-    // }
+    println!("filter:(0 none, 1 sub, 2 up, 3 avg, 4 paeth)");
+    println!("{filters:?}");
+    let mut file = File::create("file.rgb").unwrap();
+    if image_type == ImageType::IndexedColor {
+        if let Some(plte) = chunks.iter().position(|c| c.chunk_type == *b"PLTE") {
+            let _colors = chunks[plte].data;
+        }
+    } else {
+        for i in 0..height {
+            let start = scan * i;
+            let end = scan * (i + 1);
+            file.write_all(&out[start + 1..end]).unwrap();
+        }
+    }
 
     for chunk in after_idat_chunks {
         chunk.verify_crc();

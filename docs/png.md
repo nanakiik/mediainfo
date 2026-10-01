@@ -2,7 +2,7 @@
 
 `png`的spec在https://www.w3.org/TR/png-3/
 
-`png`的类型有五种：
+`png`的颜色类型有五种：
 - Truecolor with alpha: red, green, blue, alpha.
 - Greyscale with alpha: grey, alpha.
 - Truecolor: red, green, blue.
@@ -55,3 +55,14 @@ magick 1.png -depth 8 rgb:1.rgb
 magick identify -verbose 1.png
 magick 1.jpg -resize 50% 1.png
 ```
+
+## 可能有帮助的链接
+https://www.w3.org/TR/png-3  (png)
+
+https://datatracker.ietf.org/doc/html/rfc1950  (zlib)
+
+https://datatracker.ietf.org/doc/html/rfc1951  (deflate)
+
+https://github.com/madler/zlib/blob/develop/contrib/puff/README (inflate)
+
+https://github.com/pnggroup/pngcheck 

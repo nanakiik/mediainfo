@@ -5,43 +5,18 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug executable 'pnginfo'",
+            "name": "Debug executable 'mediainfo'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
                 "args": [
                     "run",
-                    "--bin=pnginfo"
+                    "--bin=mediainfo"
                 ]
             },
             "args": [
-                "pnginfo.png"
+                ""
             ]
         },
-        {
-            "name": "Debug unit tests in executable 'pnginfo'",
-            "type": "lldb",
-            "request": "launch",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--bin=pnginfo"
-                ]
-            }
-        },
-        {
-            "name": "Debug example 'flac'",
-            "type": "lldb",
-            "request": "launch",
-            "cargo": {
-                "args": [
-                    "run",
-                    "--example=flac"
-                ]
-            },
-            "args": [
-                "1.flac"
-            ]
-        }
     ]
 }
